@@ -3,8 +3,6 @@ name = "blind-ovote"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 ark-ec-blind-signatures = { git = "https://github.com/aragonzkresearch/ark-ec-blind-signatures" }
 # ark-ec-blind-signatures = { path = "../ark-ec-blind-signatures" }
@@ -25,4 +23,6 @@ ark-groth16 = { version = "^0.3.0" }
 tracing = { version = "0.1", default-features = false, features = [ "attributes" ] }
 tracing-subscriber = { version = "0.2" }
 derivative = { version = "2.0", features = ["use_core"] }
+
 ethers = "1.0.0"
+tokio = { version = "1.18", features = ["macros", "rt-multi-thread"] }
