@@ -1,5 +1,8 @@
 #![allow(unused)] // TMP
 
+// #[cfg(feature="r1cs")]
+pub mod constraints;
+
 use ark_ec_blind_signatures::{
     BlindSigScheme, BlindedSignature, Parameters as BlindParameters, PublicKey, SecretKey,
     Signature, UserSecretData,
