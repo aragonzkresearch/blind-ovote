@@ -155,7 +155,7 @@ impl Voter {
     }
 
     pub fn unblind(&self, s_blinded: Fr) -> Signature<EdwardsProjective> {
-        S::unblind(s_blinded, self.secret_data.as_ref().unwrap().clone())
+        S::unblind(s_blinded, self.secret_data.as_ref().unwrap())
     }
 }
 
