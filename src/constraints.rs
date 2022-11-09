@@ -25,12 +25,10 @@ use ark_r1cs_std::{
     prelude::CurveVar,
     ToBitsGadget,
 };
-use ark_std::ops::Mul;
+use ark_std::ops::{Mul, Sub};
 
 use arkworks_native_gadgets::poseidon as poseidon_native;
 use arkworks_r1cs_gadgets::poseidon::{FieldHasherGadget, PoseidonGadget};
-
-pub struct ParametersVar {}
 
 pub struct BlindOVOTECircuit<const N_AUTHS: usize, const N_VOTERS: usize> {
     params: Parameters,
@@ -51,12 +49,16 @@ pub struct BlindOVOTECircuit<const N_AUTHS: usize, const N_VOTERS: usize> {
 }
 impl<const N_AUTHS: usize, const N_VOTERS: usize> BlindOVOTECircuit<N_AUTHS, N_VOTERS> {
     pub fn public_inputs(self) -> Vec<ConstraintF> {
-        vec![
+        let mut pub_inp = vec![
             self.chain_id.unwrap(),
             self.process_id.unwrap(),
             self.result.unwrap(),
-            // self.pks_a.unwrap(), // TODO unwrap array
-        ]
+        ];
+        for pk in self.pks_a.unwrap().iter() {
+            pub_inp.push(pk.x);
+            pub_inp.push(pk.y);
+        }
+        pub_inp
     }
 }
 
@@ -157,6 +159,46 @@ impl<const N_AUTHS: usize, const N_VOTERS: usize> ConstraintSynthesizer<Constrai
             PoseidonGadget::<ConstraintF>::from_native(&mut cs.clone(), self.poseidon_hash_native)
                 .unwrap();
 
+        let mut comp_result: FpVar<ConstraintF> = FpVar::Constant(Fp256::from(0));
+        for i in 0..N_VOTERS {
+            // 1. verify Authority blind signatures over Voters public keys
+            let msg = MsgVar::<2, EdwardsProjective, EdwardsVar>::new([
+                voter_pks[i].pub_key.x.clone(),
+                voter_pks[i].pub_key.y.clone(),
+            ]);
+            let v = BlindSigVerifyGadget::<2, EdwardsProjective, EdwardsVar>::verify(
+                &blind_params,
+                &poseidon_hash,
+                &msg,
+                &authority_sigs[0], // WIP
+                &authority_pks[0],  // WIP
+            )?;
+            v.enforce_equal(&Boolean::TRUE)?;
+
+            // 2. verify Voters signatures (non-blind) over vote value
+            let msg = MsgVar::<1, EdwardsProjective, EdwardsVar>::new([votes[i].clone()]);
+            let v = BlindSigVerifyGadget::<1, EdwardsProjective, EdwardsVar>::verify(
+                &blind_params,
+                &poseidon_hash,
+                &msg,
+                &voter_sigs[i],
+                &voter_pks[i],
+            )?;
+            v.enforce_equal(&Boolean::TRUE)?;
+
+            // 3. check vote is binary, v ∈ { 0, 1 } (binary check: v*(v-1)==0))
+            let zero: FpVar<ConstraintF> = FpVar::Constant(Fp256::from(0));
+            let one: FpVar<ConstraintF> = FpVar::Constant(Fp256::from(1));
+            votes[i]
+                .clone()
+                .mul(votes[i].clone().sub(&one))
+                .enforce_equal(&zero)?;
+
+            // 4. compute result, ∑ vᵢ ⋅ wᵢ = R
+            comp_result += votes[i].clone(); // WIP to be add weight (votes[i] * weight[i])
+
+            // 5. ensure that there are no repeated Voter pks (nullifier) TODO
+        }
         Ok(())
     }
 }
