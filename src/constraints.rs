@@ -116,22 +116,21 @@ impl<const N_AUTHS: usize, const N_VOTERS: usize> ConstraintSynthesizer<Constrai
             )?;
 
         // public inputs
-        let chain_id =
-            FpVar::<ConstraintF>::new_witness(ark_relations::ns!(cs, "chain_id"), || {
-                self.chain_id.ok_or(SynthesisError::AssignmentMissing)
-            })?;
+        let chain_id = FpVar::<ConstraintF>::new_input(ark_relations::ns!(cs, "chain_id"), || {
+            self.chain_id.ok_or(SynthesisError::AssignmentMissing)
+        })?;
         let process_id =
-            FpVar::<ConstraintF>::new_witness(ark_relations::ns!(cs, "process_id"), || {
+            FpVar::<ConstraintF>::new_input(ark_relations::ns!(cs, "process_id"), || {
                 self.process_id.ok_or(SynthesisError::AssignmentMissing)
             })?;
-        let result = FpVar::<ConstraintF>::new_witness(ark_relations::ns!(cs, "result"), || {
+        let result = FpVar::<ConstraintF>::new_input(ark_relations::ns!(cs, "result"), || {
             self.result.ok_or(SynthesisError::AssignmentMissing)
         })?;
         let mut authority_pks: Vec<PublicKeyVar<EdwardsProjective, EdwardsVar>> = Vec::new();
         for i in 0..N_AUTHS {
             let pk_a = self.pks_a.as_ref().and_then(|pk| pk.get(i));
 
-            let pk_a = PublicKeyVar::<EdwardsProjective, EdwardsVar>::new_witness(
+            let pk_a = PublicKeyVar::<EdwardsProjective, EdwardsVar>::new_input(
                 ark_relations::ns!(cs, "pk_a"),
                 || pk_a.ok_or(SynthesisError::AssignmentMissing),
             )?;
@@ -285,8 +284,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_constraint_system() {
-        const N_VOTERS: usize = 5;
-        let circuit = gen_test_data::<1, N_VOTERS>().await;
+        const N_AUTHS: usize = 1;
+        const N_VOTERS: usize = 3;
+        let circuit = gen_test_data::<N_AUTHS, N_VOTERS>().await;
 
         let cs = ConstraintSystem::<ConstraintF>::new_ref();
         circuit.generate_constraints(cs.clone()).unwrap();
@@ -297,5 +297,28 @@ mod tests {
             N_VOTERS,
             cs.num_constraints()
         );
+    }
+
+    #[tokio::test]
+    async fn test_blind_ovote_circuit() {
+        const N_AUTHS: usize = 1;
+        const N_VOTERS: usize = 3;
+        let circuit = gen_test_data::<N_AUTHS, N_VOTERS>().await;
+        let circuit_cs = circuit.clone();
+
+        use ark_bn254::Bn254;
+        use ark_groth16::Groth16;
+        use ark_snark::SNARK;
+        let mut rng = ark_std::test_rng();
+
+        let (pk, vk) = Groth16::<Bn254>::circuit_specific_setup(circuit_cs, &mut rng).unwrap();
+        assert_eq!(vk.gamma_abc_g1.len(), 3 + 2 * N_AUTHS + 1);
+
+        let proof = Groth16::prove(&pk, circuit.clone(), &mut rng).unwrap();
+
+        let public_inputs = circuit.public_inputs();
+
+        let valid_proof = Groth16::verify(&vk, &public_inputs, &proof).unwrap();
+        assert!(valid_proof);
     }
 }
