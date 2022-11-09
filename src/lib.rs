@@ -182,10 +182,11 @@ impl Voter {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct VotePackage {
     vote: Fq,
     pk_v: PublicKey<EdwardsProjective>,
-    sig_a: Signature<EdwardsProjective>,
+    sig_a: Signature<EdwardsProjective>, // WIP will be an array for each N_AUTHS
     sig_v: Signature<EdwardsProjective>,
 }
 
