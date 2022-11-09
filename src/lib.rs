@@ -160,6 +160,33 @@ impl Voter {
     pub fn unblind(&self, s_blinded: Fr) -> Signature<EdwardsProjective> {
         S::unblind(s_blinded, self.secret_data.as_ref().unwrap())
     }
+    pub fn new_vote_package<R: Rng>(
+        &self,
+        rng: &mut R,
+        sig_a: &Signature<EdwardsProjective>,
+        vote: Fq,
+    ) -> Result<VotePackage, ark_crypto_primitives::Error> {
+        let sig = S::non_blind_sign(
+            &self.params.blind_params,
+            rng,
+            &self.params.hash,
+            self.secret_key,
+            &[vote],
+        )?;
+        Ok(VotePackage {
+            vote,
+            pk_v: self.public_key,
+            sig_a: sig_a.clone(),
+            sig_v: sig,
+        })
+    }
+}
+
+pub struct VotePackage {
+    vote: Fq,
+    pk_v: PublicKey<EdwardsProjective>,
+    sig_a: Signature<EdwardsProjective>,
+    sig_v: Signature<EdwardsProjective>,
 }
 
 #[derive(Clone, Debug)]
@@ -189,7 +216,7 @@ impl BlindOVOTE {
     pub fn new_voter<R: Rng>(&self, rng: &mut R, eth_wallet: EthWallet) -> Voter {
         Voter::new(self.params.clone(), rng, eth_wallet)
     }
-    pub fn verify_blind_sig(
+    pub fn verify_authority_sig(
         params: &Parameters,
         pk_voter: PublicKey<EdwardsProjective>,
         // weight: Fq,
@@ -198,6 +225,16 @@ impl BlindOVOTE {
     ) -> bool {
         // let msg: [Fq; 3] = [pk_voter.x, pk_voter.y, weight];
         let msg: [Fq; 2] = [pk_voter.x, pk_voter.y];
+        S::verify(&params.blind_params, &params.hash, &msg, s_auth, pk_auth)
+    }
+
+    pub fn verify_voter_sig(
+        params: &Parameters,
+        vote: Fq,
+        s_auth: Signature<EdwardsProjective>,
+        pk_auth: PublicKey<EdwardsProjective>,
+    ) -> bool {
+        let msg: [Fq; 1] = [vote];
         S::verify(&params.blind_params, &params.hash, &msg, s_auth, pk_auth)
     }
 }
@@ -247,14 +284,28 @@ mod tests {
 
         let s_blinded = authority.blind_sign(auth_msg).unwrap();
 
+        // Voter unblinds the authority signature
         let s_auth = voter.unblind(s_blinded);
 
-        let verified = BlindOVOTE::verify_blind_sig(
+        // Voter builds vote_package
+        let vote = Fq::one();
+        let vp = voter.new_vote_package(&mut rng, &s_auth, vote).unwrap();
+
+        // verify blind signature
+        let verified = BlindOVOTE::verify_authority_sig(
             &bo.params,
-            voter.public_key,
+            vp.pk_v, // Voter pk
             // weight,
-            s_auth,
-            authority.public_key,
+            vp.sig_a,             // Authority sig over Voter's pk
+            authority.public_key, // Authority pk
+        );
+        assert!(verified);
+
+        // verify Voter signature
+        let verified = BlindOVOTE::verify_voter_sig(
+            &bo.params, vp.vote,  // vote being signed
+            vp.sig_v, // Voter sig over vote value
+            vp.pk_v,  // Voter pk
         );
         assert!(verified);
     }
