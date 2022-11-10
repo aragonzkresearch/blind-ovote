@@ -107,6 +107,7 @@ impl Authority {
 
 pub struct Voter {
     params: Parameters,
+    chain_id: Fq,
     eth_wallet: EthWallet,
     secret_key: SecretKey<EdwardsProjective>,
     public_key: PublicKey<EdwardsProjective>,
@@ -114,10 +115,16 @@ pub struct Voter {
 }
 
 impl Voter {
-    pub fn new<R: Rng>(params: Parameters, rng: &mut R, eth_wallet: EthWallet) -> Self {
+    pub fn new<R: Rng>(
+        params: Parameters,
+        rng: &mut R,
+        chain_id: Fq,
+        eth_wallet: EthWallet,
+    ) -> Self {
         let (pk, sk) = S::keygen(&params.blind_params, rng);
         Self {
             params,
+            chain_id,
             eth_wallet,
             secret_key: sk,
             public_key: pk,
@@ -139,6 +146,7 @@ impl Voter {
     pub async fn blind<R: Rng>(
         &mut self,
         rng: &mut R,
+        process_id: Fq,
         signer_r: EdwardsAffine,
     ) -> Result<EthAuthenticatedMsg, EthWalletError> {
         // blind public_key + [weight (?)]
@@ -146,7 +154,12 @@ impl Voter {
             &self.params.blind_params,
             rng,
             &self.params.hash,
-            &[self.public_key.x, self.public_key.y], // TODO add weight
+            &[
+                self.chain_id,
+                process_id,
+                self.public_key.x,
+                self.public_key.y,
+            ], // TODO add weight
             signer_r,
         )
         .unwrap();
@@ -163,6 +176,7 @@ impl Voter {
     pub fn new_vote_package<R: Rng>(
         &self,
         rng: &mut R,
+        process_id: Fq,
         sig_a: &Signature<EdwardsProjective>,
         vote: Fq,
     ) -> Result<VotePackage, ark_crypto_primitives::Error> {
@@ -171,7 +185,7 @@ impl Voter {
             rng,
             &self.params.hash,
             self.secret_key,
-            &[vote],
+            &[self.chain_id, process_id, vote],
         )?;
         Ok(VotePackage {
             vote,
@@ -214,28 +228,32 @@ impl BlindOVOTE {
     pub fn new_authority<R: Rng>(&self, rng: &mut R, list_ethaddrs: Vec<EthAddress>) -> Authority {
         Authority::new(&self.params, rng, list_ethaddrs)
     }
-    pub fn new_voter<R: Rng>(&self, rng: &mut R, eth_wallet: EthWallet) -> Voter {
-        Voter::new(self.params.clone(), rng, eth_wallet)
+    pub fn new_voter<R: Rng>(&self, rng: &mut R, chain_id: Fq, eth_wallet: EthWallet) -> Voter {
+        Voter::new(self.params.clone(), rng, chain_id, eth_wallet)
     }
     pub fn verify_authority_sig(
         params: &Parameters,
+        chain_id: Fq,
+        process_id: Fq,
         pk_voter: PublicKey<EdwardsProjective>,
         // weight: Fq,
         s_auth: Signature<EdwardsProjective>,
         pk_auth: PublicKey<EdwardsProjective>,
     ) -> bool {
-        // let msg: [Fq; 3] = [pk_voter.x, pk_voter.y, weight];
-        let msg: [Fq; 2] = [pk_voter.x, pk_voter.y];
+        // let msg: [Fq; 5] = [chain_id, process_id, pk_voter.x, pk_voter.y, weight];
+        let msg: [Fq; 4] = [chain_id, process_id, pk_voter.x, pk_voter.y];
         S::verify(&params.blind_params, &params.hash, &msg, s_auth, pk_auth)
     }
 
     pub fn verify_voter_sig(
         params: &Parameters,
+        chain_id: Fq,
+        process_id: Fq,
         vote: Fq,
         s_auth: Signature<EdwardsProjective>,
         pk_auth: PublicKey<EdwardsProjective>,
     ) -> bool {
-        let msg: [Fq; 1] = [vote];
+        let msg: [Fq; 3] = [chain_id, process_id, vote];
         S::verify(&params.blind_params, &params.hash, &msg, s_auth, pk_auth)
     }
 }
@@ -248,10 +266,12 @@ mod tests {
     #[tokio::test]
     async fn test_auth_msg() {
         let mut rng = ark_std::test_rng();
-        let poseidon_params = poseidon_setup_params::<Fq>(Curve::Bn254, 5, 4);
+        let poseidon_params = poseidon_setup_params::<Fq>(Curve::Bn254, 5, 5);
+        let chain_id = Fq::from(42);
+        let process_id = Fq::from(1);
         let bo = BlindOVOTE::setup(poseidon_params);
         let voter_eth_wallet = EthWallet::new(&mut rng);
-        let voter = bo.new_voter(&mut rng, voter_eth_wallet);
+        let voter = bo.new_voter(&mut rng, chain_id, voter_eth_wallet);
 
         let msg = Fr::from(42_u64);
         let mut auth_msg = voter.new_auth_msg(msg).await.unwrap();
@@ -266,7 +286,9 @@ mod tests {
     #[tokio::test]
     async fn test_single_voter_flow() {
         let mut rng = ark_std::test_rng();
-        let poseidon_params = poseidon_setup_params::<Fq>(Curve::Bn254, 5, 4);
+        let poseidon_params = poseidon_setup_params::<Fq>(Curve::Bn254, 5, 5);
+        let chain_id = Fq::from(42);
+        let process_id = Fq::from(1);
 
         let bo = BlindOVOTE::setup(poseidon_params);
 
@@ -274,14 +296,14 @@ mod tests {
 
         let voter_eth_wallet = EthWallet::new(&mut rng);
         // let weight = Fq::from(5_u64);
-        let mut voter = bo.new_voter(&mut rng, voter_eth_wallet);
+        let mut voter = bo.new_voter(&mut rng, chain_id, voter_eth_wallet);
 
         let msg = Fr::one();
         let auth_msg = voter.new_auth_msg(msg).await.unwrap();
 
         // Voter requests blind parameters to the Authority
         let signer_r = authority.new_request_params(&mut rng, auth_msg).unwrap();
-        let auth_msg = voter.blind(&mut rng, signer_r).await.unwrap();
+        let auth_msg = voter.blind(&mut rng, process_id, signer_r).await.unwrap();
 
         let s_blinded = authority.blind_sign(auth_msg).unwrap();
 
@@ -290,11 +312,15 @@ mod tests {
 
         // Voter builds vote_package
         let vote = Fq::one();
-        let vp = voter.new_vote_package(&mut rng, &s_auth, vote).unwrap();
+        let vp = voter
+            .new_vote_package(&mut rng, process_id, &s_auth, vote)
+            .unwrap();
 
         // verify blind signature
         let verified = BlindOVOTE::verify_authority_sig(
             &bo.params,
+            chain_id,
+            process_id,
             vp.pk_v, // Voter pk
             // weight,
             vp.sig_a,             // Authority sig over Voter's pk
@@ -304,7 +330,7 @@ mod tests {
 
         // verify Voter signature
         let verified = BlindOVOTE::verify_voter_sig(
-            &bo.params, vp.vote,  // vote being signed
+            &bo.params, chain_id, process_id, vp.vote,  // vote being signed
             vp.sig_v, // Voter sig over vote value
             vp.pk_v,  // Voter pk
         );

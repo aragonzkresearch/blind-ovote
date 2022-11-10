@@ -156,22 +156,31 @@ impl<const N_AUTHS: usize, const N_VOTERS: usize> ConstraintSynthesizer<Constrai
         let mut comp_result: FpVar<ConstraintF> = FpVar::Constant(Fp256::from(0));
         for vote_package in vote_packages.iter().take(N_VOTERS) {
             // 1. verify Authority blind signatures over Voters public keys
-            let msg = MsgVar::<2, EdwardsProjective, EdwardsVar>::new([
+            const AUTHORITY_MSG_LEN: usize = 4;
+            let msg = MsgVar::<AUTHORITY_MSG_LEN, EdwardsProjective, EdwardsVar>::new([
+                chain_id.clone(),
+                process_id.clone(),
                 vote_package.pk_v.pub_key.x.clone(),
                 vote_package.pk_v.pub_key.y.clone(),
             ]);
-            let v = BlindSigVerifyGadget::<2, EdwardsProjective, EdwardsVar>::verify(
-                &blind_params,
-                &poseidon_hash,
-                &msg,
-                &vote_package.sig_a, // WIP
-                &authority_pks[0],   // WIP
-            )?;
+            let v =
+                BlindSigVerifyGadget::<AUTHORITY_MSG_LEN, EdwardsProjective, EdwardsVar>::verify(
+                    &blind_params,
+                    &poseidon_hash,
+                    &msg,
+                    &vote_package.sig_a, // WIP
+                    &authority_pks[0],   // WIP
+                )?;
             v.enforce_equal(&Boolean::TRUE)?;
 
             // 2. verify Voters signatures (non-blind) over vote value
-            let msg = MsgVar::<1, EdwardsProjective, EdwardsVar>::new([vote_package.vote.clone()]);
-            let v = BlindSigVerifyGadget::<1, EdwardsProjective, EdwardsVar>::verify(
+            const VOTER_MSG_LEN: usize = 3;
+            let msg = MsgVar::<VOTER_MSG_LEN, EdwardsProjective, EdwardsVar>::new([
+                chain_id.clone(),
+                process_id.clone(),
+                vote_package.vote.clone(),
+            ]);
+            let v = BlindSigVerifyGadget::<VOTER_MSG_LEN, EdwardsProjective, EdwardsVar>::verify(
                 &blind_params,
                 &poseidon_hash,
                 &msg,
@@ -206,6 +215,8 @@ mod tests {
 
     async fn gen_vote_packages<const N_VOTERS: usize>(
         bo: &BlindOVOTE,
+        chain_id: Fq,
+        process_id: Fq,
     ) -> (Authority, [VotePackage; N_VOTERS], Fq) {
         let mut rng = ark_std::test_rng();
 
@@ -215,14 +226,14 @@ mod tests {
         let mut result: Fq = Fq::zero();
         for i in 0..N_VOTERS {
             let voter_eth_wallet = EthWallet::new(&mut rng);
-            let mut voter = bo.new_voter(&mut rng, voter_eth_wallet);
+            let mut voter = bo.new_voter(&mut rng, chain_id, voter_eth_wallet);
 
             let msg = Fr::one();
             let auth_msg = voter.new_auth_msg(msg).await.unwrap();
 
             // Voter requests blind parameters to the Authority
             let signer_r = authority.new_request_params(&mut rng, auth_msg).unwrap();
-            let auth_msg = voter.blind(&mut rng, signer_r).await.unwrap();
+            let auth_msg = voter.blind(&mut rng, process_id, signer_r).await.unwrap();
 
             let s_blinded = authority.blind_sign(auth_msg).unwrap();
 
@@ -231,13 +242,17 @@ mod tests {
 
             // Voter builds vote_package
             let vote = Fq::one();
-            let vp = voter.new_vote_package(&mut rng, &s_auth, vote).unwrap();
+            let vp = voter
+                .new_vote_package(&mut rng, process_id, &s_auth, vote)
+                .unwrap();
 
             vote_packages.push(vp.clone());
 
             // verify blind signature
             let verified = BlindOVOTE::verify_authority_sig(
                 &bo.params,
+                chain_id,
+                process_id,
                 vp.pk_v, // Voter pk
                 // weight,
                 vp.sig_a,             // Authority sig over Voter's pk
@@ -247,7 +262,7 @@ mod tests {
 
             // verify Voter signature
             let verified = BlindOVOTE::verify_voter_sig(
-                &bo.params, vp.vote,  // vote being signed
+                &bo.params, chain_id, process_id, vp.vote,  // vote being signed
                 vp.sig_v, // Voter sig over vote value
                 vp.pk_v,  // Voter pk
             );
@@ -261,18 +276,21 @@ mod tests {
 
     async fn gen_test_data<const N_AUTHS: usize, const N_VOTERS: usize>(
     ) -> BlindOVOTECircuit<N_AUTHS, N_VOTERS> {
-        let poseidon_params = poseidon_setup_params::<Fq>(Curve::Bn254, 5, 4);
+        let chain_id = Fq::from(42);
+        let process_id = Fq::from(1);
+        let poseidon_params = poseidon_setup_params::<Fq>(Curve::Bn254, 5, 5);
 
         let bo = BlindOVOTE::setup(poseidon_params);
 
-        let (authority, vote_packages, result) = gen_vote_packages::<N_VOTERS>(&bo).await;
+        let (authority, vote_packages, result) =
+            gen_vote_packages::<N_VOTERS>(&bo, chain_id, process_id).await;
 
         let circuit = BlindOVOTECircuit::<N_AUTHS, N_VOTERS> {
             params: bo.params.clone(),
 
             // public inputs
-            chain_id: Some(Fq::one()),
-            process_id: Some(Fq::one()),
+            chain_id: Some(chain_id),
+            process_id: Some(process_id),
             result: Some(result),
             pks_a: Some([authority.public_key; N_AUTHS]), // WIP
 
