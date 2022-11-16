@@ -1,4 +1,4 @@
-use crate::{Fq, Fr, Parameters, VotePackage};
+use crate::{check_vote_packages_sorted, sort_vote_packages, Fq, Fr, Parameters, VotePackage};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, Namespace, SynthesisError};
 type ConstraintF = Fq;
 
@@ -26,6 +26,7 @@ use ark_r1cs_std::{
     ToBitsGadget,
 };
 use ark_std::ops::{Mul, Sub};
+use ark_std::str::FromStr;
 use core::{borrow::Borrow, marker::PhantomData};
 
 use arkworks_native_gadgets::poseidon as poseidon_native;
@@ -84,7 +85,7 @@ pub struct BlindOVOTECircuit<const N_AUTHS: usize, const N_VOTERS: usize> {
     pub pks_a: Option<[PublicKey<EdwardsProjective>; N_AUTHS]>,
 
     // private inputs
-    pub vote_packages: Option<[VotePackage; N_VOTERS]>,
+    pub vote_packages: Option<Vec<VotePackage>>,
 }
 impl<const N_AUTHS: usize, const N_VOTERS: usize> BlindOVOTECircuit<N_AUTHS, N_VOTERS> {
     pub fn public_inputs(self) -> Vec<ConstraintF> {
@@ -154,6 +155,7 @@ impl<const N_AUTHS: usize, const N_VOTERS: usize> ConstraintSynthesizer<Constrai
             PoseidonGadget::<ConstraintF>::from_native(&mut cs.clone(), self.params.hash).unwrap();
 
         let mut comp_result: FpVar<ConstraintF> = FpVar::Constant(Fp256::from(0));
+        let mut prev_nullifier: FpVar<ConstraintF> = FpVar::Constant(Fp256::from(1));
         for vote_package in vote_packages.iter().take(N_VOTERS) {
             // 1. verify Authority blind signatures over Voters public keys
             const AUTHORITY_MSG_LEN: usize = 4;
@@ -198,9 +200,56 @@ impl<const N_AUTHS: usize, const N_VOTERS: usize> ConstraintSynthesizer<Constrai
             // 4. compute result, ∑ vᵢ ⋅ wᵢ = R
             comp_result += vote.clone(); // WIP to be add weight (votes[i] * weight[i])
 
-            // 5. ensure that there are no repeated Voter pks (nullifier) TODO
+            // 5. ensure that there are no repeated Voter pks (nullifier).
+            // The approach for ensuring non-repeated user public keys can be found in the
+            // Blind-OVOTE document, on section 3.2.1.
+            let to_hash = [
+                chain_id.clone(),
+                process_id.clone(),
+                vote_package.pk_v.pub_key.x.clone(),
+                vote_package.pk_v.pub_key.y.clone(),
+            ];
+            let nullifier = poseidon_hash.hash(&to_hash)?; // Note: this hash is already done for sig_A verification, update ark-ec-blind-signatures to reuse the hash
+
+            let n = Nullifier(nullifier.clone());
+            let prev_n = Nullifier(prev_nullifier.clone());
+            let is_smaller = prev_n.less_than(&n);
+            is_smaller.enforce_equal(&Boolean::TRUE)?;
+
+            let prev_nullifier = nullifier.clone();
         }
         Ok(())
+    }
+}
+
+pub struct Nullifier(pub FpVar<ConstraintF>);
+impl Nullifier {
+    #[tracing::instrument(target = "r1cs", skip(self, other))]
+    pub fn less_than(&self, other: &Self) -> Boolean<ConstraintF> {
+        // The trick used in this method is an adaptation from circomlib trick for LessThan
+        // circuit: https://github.com/iden3/circomlib/blob/master/circuits/comparators.circom#L62
+        // We explain it in the Blind-OVOTE document, in the last part of section 3.2.1.
+
+        let one: FpVar<ConstraintF> = FpVar::Constant(Fp256::from(1));
+        let n = 252_usize; // 252 = ConstraintF max .num_bits - 1
+
+        // Note: nullifiers should be cropped to be less or equal to 252 bits length
+        let self_bits = self.0.to_bits_le().unwrap();
+        let other_bits = other.0.to_bits_le().unwrap();
+
+        let self_252 = Boolean::le_bits_to_fp_var(&self_bits[..n]).unwrap();
+        let other_252 = Boolean::le_bits_to_fp_var(&other_bits[..n]).unwrap();
+
+        let upper = FpVar::Constant(
+            Fp256::from_str(
+                //  1<<252 (for 252 bits), where 252 = ConstraintF max num_bits - 1
+                "7237005577332262213973186563042994240829374041602535252466099000494570602496",
+            )
+            .unwrap(),
+        );
+        let c = self_252 + upper - other_252;
+        let c_bits = c.to_bits_le().unwrap();
+        c_bits[n].not()
     }
 }
 
@@ -217,7 +266,7 @@ mod tests {
         bo: &BlindOVOTE,
         chain_id: Fq,
         process_id: Fq,
-    ) -> (Authority, [VotePackage; N_VOTERS], Fq) {
+    ) -> (Authority, Vec<VotePackage>, Fq) {
         let mut rng = ark_std::test_rng();
 
         let mut authority = bo.new_authority(&mut rng, Vec::new());
@@ -270,8 +319,17 @@ mod tests {
 
             result += vp.vote;
         }
-        let vps: [VotePackage; N_VOTERS] = vote_packages.try_into().unwrap();
-        (authority, vps, result)
+        // sort vote_packages by nullifier
+        let vote_packages_sorted =
+            sort_vote_packages(bo.params.hash.clone(), chain_id, process_id, vote_packages);
+        assert!(check_vote_packages_sorted(
+            bo.params.hash.clone(),
+            chain_id,
+            process_id,
+            vote_packages_sorted.clone()
+        ));
+
+        (authority, vote_packages_sorted, result)
     }
 
     async fn gen_test_data<const N_AUTHS: usize, const N_VOTERS: usize>(
@@ -300,6 +358,91 @@ mod tests {
         circuit
     }
 
+    #[test]
+    fn test_nullifier_less_than() {
+        let a: Nullifier = Nullifier(FpVar::Constant(Fp256::from(35)));
+        let b: Nullifier = Nullifier(FpVar::Constant(Fp256::from(36)));
+        let r = a.less_than(&b);
+        assert_eq!(r, Boolean::TRUE);
+        let r = b.less_than(&a);
+        assert_eq!(r, Boolean::FALSE);
+
+        let a: Nullifier = Nullifier(FpVar::Constant(Fp256::from(36)));
+        let b: Nullifier = Nullifier(FpVar::Constant(Fp256::from(36)));
+        let r = a.less_than(&b);
+        assert_eq!(r, Boolean::FALSE);
+
+        let a: Nullifier = Nullifier(FpVar::Constant(
+            Fp256::from_str(
+                "3881967462682375489551153299716698538183749083234973749905987531968358459485",
+            )
+            .unwrap(),
+        ));
+        let b: Nullifier = Nullifier(FpVar::Constant(
+            Fp256::from_str(
+                "3881967462682375489551153299716698538183749083234973749905987531968358459486",
+            )
+            .unwrap(),
+        ));
+        let r = a.less_than(&b);
+        assert_eq!(r, Boolean::TRUE);
+        let r = b.less_than(&a);
+        assert_eq!(r, Boolean::FALSE);
+
+        // note: in this case, although a>b, when comparing the first 252 bits of a & b, a<b.
+        let a: Nullifier = Nullifier(FpVar::Constant(
+            Fp256::from_str(
+                "10601522748347301882190920919472579195149194487170401972607812044001636589468",
+            )
+            .unwrap(),
+        ));
+        let b: Nullifier = Nullifier(FpVar::Constant(
+            Fp256::from_str(
+                "3881967462682375489551153299716698538183749083234973749905987531968358459486",
+            )
+            .unwrap(),
+        ));
+        let r = a.less_than(&b);
+        assert_eq!(r, Boolean::TRUE);
+        let r = b.less_than(&a);
+        assert_eq!(r, Boolean::FALSE);
+
+        let a: Nullifier = Nullifier(FpVar::Constant(
+            Fp256::from_str(
+                "21888242871839275222246405745257275088548364400416034343698204186575808495617",
+            )
+            .unwrap(),
+        ));
+        let b: Nullifier = Nullifier(FpVar::Constant(
+            Fp256::from_str(
+                // Note: does not overflow BN254's Fr, because we're using the Fp256 type
+                "21888242871839275222246405745257275088548364400416034343698204186575808495618",
+            )
+            .unwrap(),
+        ));
+        let r = a.less_than(&b);
+        assert_eq!(r, Boolean::TRUE);
+        let r = b.less_than(&a);
+        assert_eq!(r, Boolean::FALSE);
+
+        let a: Nullifier = Nullifier(FpVar::Constant(
+            Fp256::from_str(
+                "7237005577332262213973186563042994240829374041602535252466099000494570602496",
+            )
+            .unwrap(),
+        ));
+        let b: Nullifier = Nullifier(FpVar::Constant(
+            Fp256::from_str(
+                "7237005577332262213973186563042994240829374041602535252466099000494570602497",
+            )
+            .unwrap(),
+        ));
+        let r = a.less_than(&b);
+        assert_eq!(r, Boolean::TRUE);
+        let r = b.less_than(&a);
+        assert_eq!(r, Boolean::FALSE);
+    }
+
     #[tokio::test]
     async fn test_constraint_system() {
         const N_AUTHS: usize = 1;
@@ -311,7 +454,7 @@ mod tests {
         let is_satisfied = cs.is_satisfied().unwrap();
         assert!(is_satisfied);
         println!(
-            "n_voters={:?}, num_cnstraints={:?}",
+            "n_voters={:?}, num_constraints={:?}",
             N_VOTERS,
             cs.num_constraints()
         );

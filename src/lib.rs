@@ -8,8 +8,9 @@ use ark_ec_blind_signatures::{
     Signature, UserSecretData,
 };
 use ark_ed_on_bn254::{EdwardsAffine, EdwardsProjective};
+use ark_ff::{BigInteger, PrimeField};
 use ark_std::{rand::Rng, One, UniformRand};
-use arkworks_native_gadgets::poseidon;
+use arkworks_native_gadgets::{poseidon, poseidon::FieldHasher};
 
 use arkworks_utils::Curve;
 
@@ -27,8 +28,6 @@ type S = BlindSigScheme<EdwardsProjective>;
 
 pub struct Authority {
     blind_params: BlindParameters<EdwardsProjective>,
-    hash: poseidon::Poseidon<Fq>,
-
     secret_key: SecretKey<EdwardsProjective>,
     public_key: PublicKey<EdwardsProjective>,
     list_ethaddrs: Vec<EthAddress>, // allowed eth_addrs
@@ -44,26 +43,28 @@ pub struct EthAuthenticatedMsg {
 impl EthAuthenticatedMsg {
     fn check(&self) -> Result<(), EthSignatureError> {
         // verifies eth signature
-        self.ethsig.verify(self.msg.to_string(), self.ethaddr)
+        self.ethsig
+            .verify(self.msg.into_repr().to_bytes_le(), self.ethaddr)
     }
 }
 
 impl Authority {
-    pub fn new<R: Rng>(params: &Parameters, rng: &mut R, list_ethaddrs: Vec<EthAddress>) -> Self {
-        let (pk, sk) = S::keygen(&params.blind_params, rng);
+    pub fn new<R: Rng>(
+        blind_params: &BlindParameters<EdwardsProjective>,
+        rng: &mut R,
+        list_ethaddrs: Vec<EthAddress>,
+    ) -> Self {
+        let (pk, sk) = S::keygen(blind_params, rng);
         Self {
-            blind_params: params.blind_params.clone(), // WIP
-            hash: params.hash.clone(),                 // WIP
+            blind_params: blind_params.clone(),
             secret_key: sk,
             public_key: pk,
             list_ethaddrs,
             req_params_db: HashMap::new(),
         }
     }
-    fn ethaddr_in_list(&self, ethaddr: EthAddress) -> bool {
-        // TODO
-        unimplemented!();
-    }
+    // fn ethaddr_in_list(&self, ethaddr: EthAddress) -> bool {} WIP
+
     fn authenticate(&self, auth_msg: EthAuthenticatedMsg) -> Result<(), EthSignatureError> {
         // verify eth signature
         auth_msg.check()?;
@@ -77,7 +78,9 @@ impl Authority {
         rng: &mut R,
         auth_msg: EthAuthenticatedMsg,
     ) -> Result<EdwardsAffine, EthSignatureError> {
-        // WIP: the ethsigned msg would come from a previous challenge from Authority to Voter,
+        // pending to check the ROS attack case (https://eprint.iacr.org/2020/945.pdf) --> https://eprint.iacr.org/2019/877.pdf fig.9
+
+        // Note: the ethsigned msg would come from a previous challenge from Authority to Voter,
         // which would be the msg signed for the auth_msg
 
         // authenticate voter EthAddress
@@ -134,8 +137,10 @@ impl Voter {
 
     pub async fn new_auth_msg(&self, msg: Fr) -> Result<EthAuthenticatedMsg, EthWalletError> {
         // EthSign over msg
-        // TODO msg as bytes instead of string
-        let eth_sig = self.eth_wallet.sign_message(msg.to_string()).await?;
+        let eth_sig = self
+            .eth_wallet
+            .sign_message(msg.into_repr().to_bytes_le())
+            .await?;
         Ok(EthAuthenticatedMsg {
             msg,
             ethaddr: self.eth_wallet.address(),
@@ -159,7 +164,7 @@ impl Voter {
                 process_id,
                 self.public_key.x,
                 self.public_key.y,
-            ], // TODO add weight
+            ], // potentially add weight
             signer_r,
         )
         .unwrap();
@@ -173,6 +178,17 @@ impl Voter {
     pub fn unblind(&self, s_blinded: Fr) -> Signature<EdwardsProjective> {
         S::unblind(s_blinded, self.secret_data.as_ref().unwrap())
     }
+
+    pub fn nullifier(
+        self,
+        process_id: Fq,
+        pk: PublicKey<EdwardsProjective>,
+    ) -> Result<Fq, ark_crypto_primitives::Error> {
+        let m = [self.chain_id, process_id, pk.x, pk.y];
+        let hm = self.params.hash.hash(&m)?;
+        Ok(hm)
+    }
+
     pub fn new_vote_package<R: Rng>(
         &self,
         rng: &mut R,
@@ -226,11 +242,12 @@ impl BlindOVOTE {
         }
     }
     pub fn new_authority<R: Rng>(&self, rng: &mut R, list_ethaddrs: Vec<EthAddress>) -> Authority {
-        Authority::new(&self.params, rng, list_ethaddrs)
+        Authority::new(&self.params.blind_params, rng, list_ethaddrs)
     }
     pub fn new_voter<R: Rng>(&self, rng: &mut R, chain_id: Fq, eth_wallet: EthWallet) -> Voter {
         Voter::new(self.params.clone(), rng, chain_id, eth_wallet)
     }
+
     pub fn verify_authority_sig(
         params: &Parameters,
         chain_id: Fq,
@@ -256,6 +273,82 @@ impl BlindOVOTE {
         let msg: [Fq; 3] = [chain_id, process_id, vote];
         S::verify(&params.blind_params, &params.hash, &msg, s_auth, pk_auth)
     }
+}
+
+#[derive(Clone, Debug)]
+struct VotePackageWithNullifier {
+    vp: VotePackage,
+    nullifier: Fq,
+}
+
+// sort_vote_packages sorts vote_packages by nullifier
+pub fn sort_vote_packages(
+    hash: poseidon::Poseidon<Fq>,
+    chain_id: Fq,
+    process_id: Fq,
+    vote_packages: Vec<VotePackage>,
+) -> Vec<VotePackage> {
+    let mut vpns: Vec<VotePackageWithNullifier> = Vec::new();
+    for vote_package in &vote_packages {
+        let to_hash: [Fq; 4] = [
+            chain_id,
+            process_id,
+            vote_package.pk_v.x,
+            vote_package.pk_v.y,
+        ];
+        let nullifier = hash.hash(&to_hash).unwrap();
+        let n = 252;
+        let nullifier_bits = nullifier.0.to_bits_le();
+        let nullifier_252: Fq =
+            Fq::from_repr(BigInteger::from_bits_le(&nullifier_bits[..n])).unwrap();
+        let vpn = VotePackageWithNullifier {
+            vp: vote_package.clone(),
+            nullifier: nullifier_252,
+        };
+        vpns.push(vpn.clone());
+    }
+
+    vpns.sort_by_key(|vpn| vpn.nullifier.0);
+
+    let mut r: Vec<VotePackage> = Vec::new();
+    for vpn in &vpns {
+        r.push(vpn.vp.clone());
+    }
+    r
+}
+// this method is only for internal testing purposes
+fn check_vote_packages_sorted(
+    hash: poseidon::Poseidon<Fq>,
+    chain_id: Fq,
+    process_id: Fq,
+    vote_packages: Vec<VotePackage>,
+) -> bool {
+    let mut prev_nullifier: Fq = Fq::from(0);
+    for vote_package in &vote_packages {
+        let to_hash: [Fq; 4] = [
+            chain_id,
+            process_id,
+            vote_package.pk_v.x,
+            vote_package.pk_v.y,
+        ];
+        let nullifier = hash.hash(&to_hash).unwrap();
+        let n = 252;
+        let nullifier_bits = nullifier.0.to_bits_le();
+        let nullifier_252: Fq =
+            Fq::from_repr(BigInteger::from_bits_le(&nullifier_bits[..n])).unwrap();
+
+        if prev_nullifier.0 >= nullifier_252.0 {
+            println!("NOT SORTED");
+            println!(
+                "{:?}\n{:?}",
+                prev_nullifier.0.to_string(),
+                nullifier_252.0.to_string()
+            );
+            return false;
+        }
+        prev_nullifier = nullifier_252;
+    }
+    true
 }
 
 #[cfg(test)]
