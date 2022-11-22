@@ -3,7 +3,7 @@ use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, Namespace,
 type ConstraintF = Fq;
 
 use ark_ec::ProjectiveCurve;
-use ark_ec_blind_signatures::{
+use ark_ec_blind_signatures::schnorr_blind::{
     constraints::{
         BlindSigVerifyGadget, MsgVar, ParametersVar as BlindParametersVar, PublicKeyVar,
         SignatureVar,
@@ -256,7 +256,7 @@ impl Nullifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ark_ec_blind_signatures::poseidon_setup_params;
+    use ark_ec_blind_signatures::schnorr_blind::poseidon_setup_params;
     use ark_relations::r1cs::ConstraintSystem;
 
     use crate::{Authority, BlindOVOTE, Curve, EthWallet, Fq, One, VotePackage};
@@ -282,7 +282,10 @@ mod tests {
 
             // Voter requests blind parameters to the Authority
             let signer_r = authority.new_request_params(&mut rng, auth_msg).unwrap();
-            let auth_msg = voter.blind(&mut rng, process_id, signer_r).await.unwrap();
+            let auth_msg = voter
+                .blind(&mut rng, process_id, authority.public_key, signer_r)
+                .await
+                .unwrap();
 
             let s_blinded = authority.blind_sign(auth_msg).unwrap();
 

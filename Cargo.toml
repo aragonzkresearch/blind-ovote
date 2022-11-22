@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ark-ec-blind-signatures = { git = "https://github.com/aragonzkresearch/ark-ec-blind-signatures" }
+ark-ec-blind-signatures = { git = "https://github.com/aragonzkresearch/ark-ec-blind-signatures", rev="3775f39d3468b2bc03eed96e1ee320d8078cb676"}
 # ark-ec-blind-signatures = { path = "../ark-ec-blind-signatures" }
 
 ark-ff = { version = "^0.3.0", default-features = false }

@@ -4,3 +4,4 @@
 
 > Warning: experimental code, do not use in production.
 
+Blind-OVOTE uses the Schnorr Blind Signatures implemented in https://github.com/aragonzkresearch/ark-ec-blind-signatures

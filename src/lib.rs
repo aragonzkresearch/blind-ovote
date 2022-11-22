@@ -3,7 +3,7 @@
 // #[cfg(feature="r1cs")]
 pub mod constraints;
 
-use ark_ec_blind_signatures::{
+use ark_ec_blind_signatures::schnorr_blind::{
     BlindSigScheme, BlindedSignature, Parameters as BlindParameters, PublicKey, SecretKey,
     Signature, UserSecretData,
 };
@@ -152,6 +152,7 @@ impl Voter {
         &mut self,
         rng: &mut R,
         process_id: Fq,
+        signer_pk: PublicKey<EdwardsProjective>,
         signer_r: EdwardsAffine,
     ) -> Result<EthAuthenticatedMsg, EthWalletError> {
         // blind public_key + [weight (?)]
@@ -165,6 +166,7 @@ impl Voter {
                 self.public_key.x,
                 self.public_key.y,
             ], // potentially add weight
+            signer_pk,
             signer_r,
         )
         .unwrap();
@@ -354,7 +356,7 @@ fn check_vote_packages_sorted(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ark_ec_blind_signatures::poseidon_setup_params;
+    use ark_ec_blind_signatures::schnorr_blind::poseidon_setup_params;
 
     #[tokio::test]
     async fn test_auth_msg() {
@@ -396,7 +398,10 @@ mod tests {
 
         // Voter requests blind parameters to the Authority
         let signer_r = authority.new_request_params(&mut rng, auth_msg).unwrap();
-        let auth_msg = voter.blind(&mut rng, process_id, signer_r).await.unwrap();
+        let auth_msg = voter
+            .blind(&mut rng, process_id, authority.public_key, signer_r)
+            .await
+            .unwrap();
 
         let s_blinded = authority.blind_sign(auth_msg).unwrap();
 
